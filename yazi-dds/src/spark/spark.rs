@@ -143,9 +143,12 @@ pub enum Spark<'a> {
 	TasksCancel(yazi_parser::VoidOpt),
 	TasksClose(yazi_parser::VoidOpt),
 	TasksInspect(yazi_parser::VoidOpt),
+	TasksLoadPaused(yazi_parser::VoidOpt),
 	TasksOpenShellCompat(yazi_parser::tasks::ProcessOpenOpt),
 	TasksProcessOpen(yazi_parser::tasks::ProcessOpenOpt),
+	TasksSavePaused(yazi_parser::VoidOpt),
 	TasksShow(yazi_parser::VoidOpt),
+	TasksUnpause(yazi_parser::VoidOpt),
 	TasksUpdateSucceed(yazi_parser::tasks::UpdateSucceedOpt),
 
 	// Which
@@ -324,9 +327,12 @@ impl<'a> IntoLua for Spark<'a> {
 			Self::TasksCancel(b) => b.into_lua(lua),
 			Self::TasksClose(b) => b.into_lua(lua),
 			Self::TasksInspect(b) => b.into_lua(lua),
+			Self::TasksLoadPaused(b) => b.into_lua(lua),
 			Self::TasksOpenShellCompat(b) => b.into_lua(lua),
 			Self::TasksProcessOpen(b) => b.into_lua(lua),
+			Self::TasksSavePaused(b) => b.into_lua(lua),
 			Self::TasksShow(b) => b.into_lua(lua),
+			Self::TasksUnpause(b) => b.into_lua(lua),
 			Self::TasksUpdateSucceed(b) => b.into_lua(lua),
 
 			// Which
@@ -354,6 +360,9 @@ try_from_spark!(
 	mgr:refresh,
 	mgr:search_stop,
 	mgr:suspend,
+	tasks:load_paused,
+	tasks:save_paused,
+	tasks:unpause,
 	mgr:unyank,
 	mgr:watch,
 	which:dismiss

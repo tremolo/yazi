@@ -13,6 +13,7 @@ impl From<SizeProg> for TaskSummary {
 			success: value.done as u32,
 			failed:  0,
 			percent: value.percent().map(Into::into),
+			..Default::default()
 		}
 	}
 }

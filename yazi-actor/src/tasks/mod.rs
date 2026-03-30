@@ -1,1 +1,13 @@
-yazi_macro::mod_flat!(arrow cancel close open_shell_compat inspect process_open show update_succeed);
+yazi_macro::mod_flat!(
+	arrow
+	cancel
+	close
+	inspect
+	load_paused
+	open_shell_compat
+	process_open
+	save_paused
+	show
+	unpause
+	update_succeed
+);

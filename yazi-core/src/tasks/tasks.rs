@@ -21,15 +21,20 @@ pub struct Tasks {
 
 impl Tasks {
 	pub fn serve() -> Self {
-		let scheduler = Scheduler::serve();
+		let scheduler = Arc::new(Scheduler::serve());
 		let ongoing = scheduler.ongoing.clone();
+		let scheduler_bg = scheduler.clone();
 
 		let handle = tokio::spawn(async move {
 			let mut last = TaskSummary::default();
 			loop {
 				sleep(Duration::from_millis(500)).await;
 
-				let new = ongoing.lock().summary();
+				let mut new = ongoing.lock().summary();
+				let q = scheduler_bg.transfer_counts();
+				new.transfer_active = q.active;
+				new.transfer_pending = q.pending;
+				new.transfer_blocked = q.blocked;
 				if last != new {
 					last = new;
 					AppProxy::update_progress(new);
@@ -38,7 +43,7 @@ impl Tasks {
 		});
 
 		Self {
-			scheduler: Arc::new(scheduler),
+			scheduler,
 			handle,
 
 			visible: false,

@@ -177,6 +177,9 @@ impl<'a> Executor<'a> {
 		on!(arrow);
 		on!(inspect);
 		on!(cancel);
+		on!(save_paused);
+		on!(load_paused);
+		on!(unpause);
 		on!(process_open);
 		on!(open_shell_compat);
 

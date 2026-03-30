@@ -6,6 +6,7 @@ use yazi_parser::{app::PluginOpt, tasks::ProcessOpenOpt};
 use yazi_shared::{CompletionToken, Id, Throttle, url::{UrlBuf, UrlLike}};
 
 use crate::{HIGH, LOW, NORMAL, Runner, fetch::{FetchIn, FetchProg}, file::{FileInCopy, FileInCut, FileInDelete, FileInDownload, FileInHardlink, FileInLink, FileInTrash, FileInUpload, FileOutCopy, FileOutCut, FileOutDownload, FileOutHardlink, FileOutUpload, FileProgCopy, FileProgCut, FileProgDelete, FileProgDownload, FileProgHardlink, FileProgLink, FileProgTrash, FileProgUpload}, hook::{HookInDelete, HookInDownload, HookInTrash, HookInUpload}, plugin::{PluginInEntry, PluginProgEntry}, preload::{PreloadIn, PreloadProg}, process::{ProcessInBg, ProcessInBlock, ProcessInOrphan, ProcessProgBg, ProcessProgBlock, ProcessProgOrphan}, size::{SizeIn, SizeProg}};
+use crate::{PausedTransferJob, TransferJobKind};
 
 pub struct Scheduler {
 	pub runner: Runner,
@@ -25,6 +26,7 @@ impl Scheduler {
 	}
 
 	pub fn cancel(&self, id: Id) -> bool {
+		self.runner.cancel_transfer(id);
 		if let Some(hook) = self.ongoing.lock().cancel(id) {
 			self.hook.submit(hook, HIGH);
 			return false;
@@ -39,20 +41,48 @@ impl Scheduler {
 		}
 	}
 
+	pub fn paused_transfer_jobs(&self) -> Vec<PausedTransferJob> { self.runner.blocked_jobs() }
+
+	pub fn restore_paused_transfer_jobs(&self, jobs: Vec<PausedTransferJob>) -> usize {
+		let mut added = 0;
+		for job in jobs {
+			if self.runner.has_transfer_job(&job) {
+				continue;
+			}
+
+			match job.kind {
+				TransferJobKind::Copy => {
+					self.file_copy(job.from, job.to, job.force, job.follow);
+					added += 1;
+				}
+				TransferJobKind::Cut => {
+					self.file_cut(job.from, job.to, job.force);
+					added += 1;
+				}
+			}
+		}
+		added
+	}
+
+	pub fn unpause_transfer(&self, id: Id) -> bool { self.runner.unpause_transfer(id) }
+
 	pub fn file_cut(&self, from: UrlBuf, to: UrlBuf, force: bool) {
-		let mut ongoing = self.ongoing.lock();
-		let task = ongoing.add::<FileProgCut>(format!("Cut {} to {}", from.display(), to.display()));
+		let (id, done) = {
+			let mut ongoing = self.ongoing.lock();
+			let task = ongoing.add::<FileProgCut>(format!("Cut {} to {}", from.display(), to.display()));
+			(task.id, task.done.clone())
+		};
 
 		if to.try_starts_with(&from).unwrap_or(false) && !to.covariant(&from) {
 			return self
 				.ops
-				.out(task.id, FileOutCut::Fail("Cannot cut directory into itself".to_owned()));
+				.out(id, FileOutCut::Fail("Cannot cut directory into itself".to_owned()));
 		}
 
 		let follow = !from.scheme().covariant(to.scheme());
-		self.file.submit(
+		self.runner.enqueue_transfer(
 			FileInCut {
-				id: task.id,
+				id,
 				from,
 				to,
 				force,
@@ -60,33 +90,36 @@ impl Scheduler {
 				follow,
 				retry: 0,
 				drop: None,
-				done: task.done.clone(),
+				done,
 			},
 			LOW,
 		);
 	}
 
 	pub fn file_copy(&self, from: UrlBuf, to: UrlBuf, force: bool, follow: bool) {
-		let mut ongoing = self.ongoing.lock();
-		let task = ongoing.add::<FileProgCopy>(format!("Copy {} to {}", from.display(), to.display()));
+		let (id, done) = {
+			let mut ongoing = self.ongoing.lock();
+			let task = ongoing.add::<FileProgCopy>(format!("Copy {} to {}", from.display(), to.display()));
+			(task.id, task.done.clone())
+		};
 
 		if to.try_starts_with(&from).unwrap_or(false) && !to.covariant(&from) {
 			return self
 				.ops
-				.out(task.id, FileOutCopy::Fail("Cannot copy directory into itself".to_owned()));
+				.out(id, FileOutCopy::Fail("Cannot copy directory into itself".to_owned()));
 		}
 
 		let follow = follow || !from.scheme().covariant(to.scheme());
-		self.file.submit(
+		self.runner.enqueue_transfer(
 			FileInCopy {
-				id: task.id,
+				id,
 				from,
 				to,
 				force,
 				cha: None,
 				follow,
 				retry: 0,
-				done: task.done.clone(),
+				done,
 			},
 			LOW,
 		);

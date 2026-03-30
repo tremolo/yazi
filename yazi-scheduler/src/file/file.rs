@@ -1,19 +1,32 @@
-use std::mem;
+use std::{collections::HashMap, mem, path::{Path, PathBuf}};
 
 use anyhow::{Context, Result, anyhow};
+use parking_lot::Mutex;
 use tokio::{io::{self, ErrorKind::NotFound}, sync::mpsc};
-use tracing::warn;
+use tracing::{debug, warn};
 use yazi_config::YAZI;
 use yazi_fs::{Cwd, FsHash128, FsUrl, cha::Cha, ok_or_not_found, path::path_relative_to, provider::{Attrs, FileHolder, Provider, local::Local}};
-use yazi_shared::{path::PathCow, url::{AsUrl, UrlCow, UrlLike}};
+use yazi_shared::{path::PathCow, url::{AsUrl, UrlBuf, UrlCow, UrlLike}};
 use yazi_vfs::{VfsCha, maybe_exists, provider::{self, DirEntry}, unique_file};
 
-use super::{FileInCopy, FileInDelete, FileInHardlink, FileInLink, FileInTrash};
-use crate::{LOW, NORMAL, TaskOp, TaskOps, ctx, file::{FileIn, FileInCut, FileInDownload, FileInUpload, FileOutCopy, FileOutCopyDo, FileOutCut, FileOutCutDo, FileOutDelete, FileOutDeleteDo, FileOutDownload, FileOutDownloadDo, FileOutHardlink, FileOutHardlinkDo, FileOutLink, FileOutTrash, FileOutUpload, FileOutUploadDo, Transaction, Traverse}, hook::{HookInOutCopy, HookInOutCut}, ok_or_not_found, progress_or_break};
+use super::{FileIn, FileInCopy, FileInCut, FileInDelete, FileInHardlink, FileInLink, FileInTrash};
+use crate::{LOW, NORMAL, TaskOp, TaskOps, ctx, file::{FileInDownload, FileInUpload, FileOutCopy, FileOutCopyDo, FileOutCut, FileOutCutDo, FileOutDelete, FileOutDeleteDo, FileOutDownload, FileOutDownloadDo, FileOutHardlink, FileOutHardlinkDo, FileOutLink, FileOutTrash, FileOutUpload, FileOutUploadDo, Transaction, Traverse}, hook::{HookInOutCopy, HookInOutCut}, ok_or_not_found, progress_or_break};
 
 pub(crate) struct File {
 	ops: TaskOps,
 	tx:  async_priority_channel::Sender<FileIn, u8>,
+	reservations: Mutex<HashMap<yazi_shared::Id, (PathBuf, u64)>>,
+	reserved_by_dest: Mutex<HashMap<PathBuf, u64>>,
+	#[cfg(test)]
+	mocked_available: Mutex<HashMap<PathBuf, u64>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CapacityBlocked {
+	pub(crate) dest:      PathBuf,
+	pub(crate) needed:    u64,
+	pub(crate) available: u64,
+	pub(crate) reserved:  u64,
 }
 
 impl File {
@@ -21,11 +34,20 @@ impl File {
 		ops: &mpsc::UnboundedSender<TaskOp>,
 		tx: async_priority_channel::Sender<FileIn, u8>,
 	) -> Self {
-		Self { ops: ops.into(), tx }
+		Self {
+			ops: ops.into(),
+			tx,
+			reservations: Default::default(),
+			reserved_by_dest: Default::default(),
+			#[cfg(test)]
+			mocked_available: Default::default(),
+		}
 	}
 
 	pub(crate) async fn copy(&self, mut task: FileInCopy) -> Result<(), FileOutCopy> {
 		let id = task.id;
+		let needed = task.init().await?.len;
+		self.reserve_or_fail(id, &task.to, needed)?;
 
 		if !task.force {
 			task.to = unique_file(mem::take(&mut task.to), task.init().await?.is_dir())
@@ -89,6 +111,8 @@ impl File {
 
 	pub(crate) async fn cut(&self, mut task: FileInCut) -> Result<(), FileOutCut> {
 		let id = task.id;
+		let needed = task.init().await?.len;
+		self.reserve_or_fail(id, &task.to, needed)?;
 
 		if !task.force {
 			task.to = unique_file(mem::take(&mut task.to), task.init().await?.is_dir())
@@ -462,7 +486,147 @@ impl File {
 	}
 }
 
+#[cfg(test)]
+mod tests {
+	use std::path::PathBuf;
+
+	use yazi_shared::url::UrlBuf;
+
+	use crate::file::{File, FileIn, FileInCopy};
+
+	impl File {
+		fn __test_set_available(&self, path: PathBuf, bytes: u64) {
+			self.mocked_available.lock().insert(path, bytes);
+		}
+
+		fn __test_clear_available(&self) {
+			self.mocked_available.lock().clear();
+		}
+	}
+
+	#[test]
+	fn available_bytes_uses_existing_parent_for_nonexistent_dest() {
+		let dir = std::env::temp_dir().join(format!("yazi-file-test-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let deep = dir.join("missing").join("child").join("file.bin");
+
+		let bytes = File::available_bytes(&deep).unwrap();
+		assert!(bytes > 0);
+	}
+
+	#[test]
+	fn check_transfer_slot_blocks_when_reserved_exhausts_capacity() {
+		let (op_tx, _op_rx) = tokio::sync::mpsc::unbounded_channel();
+		let (tx, _rx) = async_priority_channel::unbounded();
+		let file = File::new(&op_tx, tx);
+
+		let dir = std::env::temp_dir().join(format!("yazi-file-test-rsv-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let src = dir.join("src.bin");
+		std::fs::write(&src, vec![0u8; 8]).unwrap();
+
+		let id = yazi_shared::Id(42);
+		let dest = dir.join("dest.bin");
+		file.reserved_by_dest.lock().insert(dest.clone(), u64::MAX);
+		let r#in = FileIn::Copy(FileInCopy {
+			id,
+			from: UrlBuf::from(PathBuf::from(&src)),
+			to: UrlBuf::from(PathBuf::from(&dest)),
+			force: false,
+			cha: None,
+			follow: false,
+			retry: 0,
+			done: Default::default(),
+		});
+
+		assert!(file.check_transfer_slot(&r#in).is_err());
+	}
+
+	#[test]
+	fn release_reservation_cleans_destination_bucket() {
+		let (op_tx, _op_rx) = tokio::sync::mpsc::unbounded_channel();
+		let (tx, _rx) = async_priority_channel::unbounded();
+		let file = File::new(&op_tx, tx);
+
+		let id = yazi_shared::Id(7);
+		let dest = std::env::temp_dir().join(format!("yazi-file-test-clean-{}", std::process::id()));
+		file.reservations.lock().insert(id, (dest.clone(), 128));
+		file.reserved_by_dest.lock().insert(dest.clone(), 128);
+
+		file.release_reservation(id);
+
+		assert!(!file.reservations.lock().contains_key(&id));
+		assert!(!file.reserved_by_dest.lock().contains_key(&dest));
+	}
+
+	#[test]
+	fn prestart_revalidation_can_block_after_enqueue() {
+		let (op_tx, _op_rx) = tokio::sync::mpsc::unbounded_channel();
+		let (tx, _rx) = async_priority_channel::unbounded();
+		let file = File::new(&op_tx, tx);
+
+		let dir = std::env::temp_dir().join(format!("yazi-file-test-prestart-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let src = dir.join("src.bin");
+		std::fs::write(&src, vec![0u8; 16]).unwrap();
+		let dest = dir.join("dest.bin");
+
+		let id = yazi_shared::Id(88);
+		let r#in = FileIn::Copy(FileInCopy {
+			id,
+			from: UrlBuf::from(PathBuf::from(&src)),
+			to: UrlBuf::from(PathBuf::from(&dest)),
+			force: false,
+			cha: None,
+			follow: false,
+			retry: 0,
+			done: Default::default(),
+		});
+
+		file.__test_set_available(dest.clone(), 64);
+		assert!(file.check_transfer_slot(&r#in).is_ok());
+
+		file.__test_set_available(dest.clone(), 0);
+		assert!(file.check_transfer_slot(&r#in).is_err());
+
+		file.__test_clear_available();
+	}
+}
+
 impl File {
+	pub(crate) fn reserve_transfer_slot(&self, r#in: &FileIn) -> Result<(), CapacityBlocked> {
+		debug!("reserve_transfer_slot: id={:?}", r#in.id());
+		let Some((id, dest, needed)) = self.transfer_need(r#in).ok().flatten() else {
+			debug!("reserve_transfer_slot: skip non-local or unsupported transfer input");
+			return Ok(());
+		};
+
+		if self.reservations.lock().contains_key(&id) {
+			debug!("reserve_transfer_slot: already reserved id={id:?}");
+			return Ok(());
+		}
+
+		self.check_transfer_slot_inner(&dest, needed)?;
+
+		let mut by_dest = self.reserved_by_dest.lock();
+		let reserved = *by_dest.get(&dest).unwrap_or(&0);
+		by_dest.insert(dest.clone(), reserved.saturating_add(needed));
+		drop(by_dest);
+		self.reservations.lock().insert(id, (dest, needed));
+		debug!("reserve_transfer_slot: reserved id={id:?}");
+		Ok(())
+	}
+
+	pub(crate) fn check_transfer_slot(&self, r#in: &FileIn) -> Result<(), CapacityBlocked> {
+		debug!("check_transfer_slot: id={:?}", r#in.id());
+		let Some((_, dest, needed)) = self.transfer_need(r#in).ok().flatten() else {
+			debug!("check_transfer_slot: skip non-local or unsupported transfer input");
+			return Ok(());
+		};
+
+		self.check_transfer_slot_inner(&dest, needed)
+	}
+
 	#[inline]
 	pub(crate) fn submit(&self, r#in: impl Into<FileIn>, priority: u8) {
 		_ = self.tx.try_send(r#in.into(), priority);
@@ -471,5 +635,155 @@ impl File {
 	#[inline]
 	fn requeue(&self, r#in: impl Into<FileIn>, priority: u8) {
 		_ = self.tx.try_send(r#in.into().into_doable(), priority);
+	}
+
+	pub(crate) fn release_reservation(&self, id: yazi_shared::Id) {
+		let Some((dest, size)) = self.reservations.lock().remove(&id) else {
+			return;
+		};
+
+		let mut by_dest = self.reserved_by_dest.lock();
+		let Some(total) = by_dest.get_mut(&dest) else {
+			warn!("Missing destination reservation bucket for task {id:?} at {}", dest.display());
+			return;
+		};
+
+		if *total < size {
+			warn!(
+				"Reservation underflow for destination {}: total={}B, releasing={}B",
+				dest.display(),
+				*total,
+				size
+			);
+		}
+		*total = total.saturating_sub(size);
+		if *total == 0 {
+			by_dest.remove(&dest);
+		}
+	}
+
+	fn reserve_or_fail(&self, id: yazi_shared::Id, to: &UrlBuf, needed: u64) -> Result<()> {
+		if self.reservations.lock().contains_key(&id) {
+			return Ok(());
+		}
+
+		let Some(dest) = to.as_local().map(PathBuf::from) else {
+			return Ok(());
+		};
+
+		let available = self.available_bytes_for(&dest)?;
+		let mut by_dest = self.reserved_by_dest.lock();
+		let reserved = *by_dest.get(&dest).unwrap_or(&0);
+		if needed > available.saturating_sub(reserved) {
+			return Err(anyhow!(
+				"Not enough destination space: needed={}B, available={}B, reserved={}B",
+				needed,
+				available,
+				reserved
+			));
+		}
+
+		by_dest.insert(dest.clone(), reserved.saturating_add(needed));
+		drop(by_dest);
+		self.reservations.lock().insert(id, (dest, needed));
+		Ok(())
+	}
+
+	fn transfer_need(&self, r#in: &FileIn) -> io::Result<Option<(yazi_shared::Id, PathBuf, u64)>> {
+		let (id, from, to) = match r#in {
+			FileIn::Copy(r#in) | FileIn::CopyDo(r#in) => (r#in.id, &r#in.from, &r#in.to),
+			FileIn::Cut(r#in) | FileIn::CutDo(r#in) => (r#in.id, &r#in.from, &r#in.to),
+			_ => return Ok(None),
+		};
+
+		let Some(dest) = to.as_local().map(PathBuf::from) else {
+			return Ok(None);
+		};
+		let Some(from) = from.as_local() else {
+			return Ok(None);
+		};
+
+		let needed = match Self::required_bytes(Path::new(from)) {
+			Ok(v) => v,
+			Err(e) => {
+				warn!("transfer_need required_bytes failed for {}: {e}", Path::new(from).display());
+				return Err(e);
+			}
+		};
+		Ok(Some((id, dest, needed)))
+	}
+
+	fn check_transfer_slot_inner(&self, dest: &PathBuf, needed: u64) -> Result<(), CapacityBlocked> {
+		let available = self.available_bytes_for(dest).unwrap_or(u64::MAX);
+		let by_dest = self.reserved_by_dest.lock();
+		let reserved = *by_dest.get(dest).unwrap_or(&0);
+		if needed > available.saturating_sub(reserved) {
+			Err(CapacityBlocked {
+				dest: dest.clone(),
+				needed,
+				available,
+				reserved,
+			})
+		} else {
+			Ok(())
+		}
+	}
+
+	fn required_bytes(path: &Path) -> io::Result<u64> {
+		debug!("required_bytes: {}", path.display());
+		let meta = std::fs::symlink_metadata(path)?;
+		if !meta.is_dir() {
+			return Ok(meta.len());
+		}
+
+		let mut stack = vec![path.to_path_buf()];
+		let mut total = 0u64;
+
+		while let Some(dir) = stack.pop() {
+			for entry in std::fs::read_dir(&dir)? {
+				let entry = entry?;
+				let meta = entry.metadata()?;
+				if meta.is_dir() {
+					stack.push(entry.path());
+				} else {
+					total = total.saturating_add(meta.len());
+				}
+			}
+		}
+
+		Ok(total)
+	}
+
+	fn available_bytes_for(&self, path: &PathBuf) -> io::Result<u64> {
+		#[cfg(test)]
+		if let Some(v) = self.mocked_available.lock().get(path).copied() {
+			return Ok(v);
+		}
+
+		Self::available_bytes(path)
+	}
+
+	#[cfg(unix)]
+	fn available_bytes(path: &PathBuf) -> io::Result<u64> {
+		use std::ffi::CString;
+
+		let existing = if path.exists() {
+			path.as_path()
+		} else {
+			path.ancestors().find(|p| p.exists()).unwrap_or(path.as_path())
+		};
+
+		let c = CString::new(existing.as_os_str().as_encoded_bytes())
+			.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+		let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+		if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+	}
+
+	#[cfg(not(unix))]
+	fn available_bytes(_path: &PathBuf) -> io::Result<u64> {
+		Ok(u64::MAX)
 	}
 }

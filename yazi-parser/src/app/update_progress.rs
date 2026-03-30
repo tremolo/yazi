@@ -36,4 +36,7 @@ pub struct TaskSummary {
 	pub success: u32,
 	pub failed:  u32,
 	pub percent: Option<OrderedFloat<f32>>,
+	pub transfer_pending: usize,
+	pub transfer_blocked: usize,
+	pub transfer_active:  bool,
 }

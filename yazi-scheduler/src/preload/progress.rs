@@ -13,6 +13,7 @@ impl From<PreloadProg> for TaskSummary {
 			success: (value.state == Some(true)) as u32,
 			failed:  (value.state == Some(false)) as u32,
 			percent: value.percent().map(Into::into),
+			..Default::default()
 		}
 	}
 }

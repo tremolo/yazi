@@ -9,6 +9,7 @@ pub struct Tasks {
 	pub fetch_workers:   u8,
 	pub preload_workers: u8,
 	pub process_workers: u8,
+	pub auto_restart_paused: bool,
 
 	pub bizarre_retry: u8,
 

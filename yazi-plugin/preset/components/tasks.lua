@@ -23,9 +23,15 @@ function Tasks:reflow() return { self } end
 
 function Tasks:redraw()
 	local elements = {}
+	local has_statusbar = cx.tasks.summary.transfer_pending > 0 or cx.tasks.summary.transfer_blocked > 0
+	if has_statusbar then
+		elements[#elements + 1] = self:statusbar()
+	end
+
 	for i, snap in ipairs(cx.tasks.snaps) do
 		local y = self._area.y + (i - 1) * 3
-		if y >= self._area.bottom then
+		local bottom = has_statusbar and (self._area.bottom - 1) or self._area.bottom
+		if y >= bottom then
 			break
 		end
 
@@ -59,6 +65,26 @@ function Tasks:redraw()
 	end
 
 	return elements
+end
+
+function Tasks:statusbar()
+	local summary = cx.tasks.summary
+	local state = summary.transfer_active and "active" or "idle"
+	local text = string.format(
+		"Transfer queue: %s | pending: %d | waiting for space: %d",
+		state,
+		summary.transfer_pending,
+		summary.transfer_blocked
+	)
+
+	return ui.Line(text)
+		:fg("yellow")
+		:area(ui.Rect {
+			x = self._area.x,
+			y = self._area.bottom - 1,
+			w = self._area.w,
+			h = 1,
+		})
 end
 
 function Tasks:icon(snap)
